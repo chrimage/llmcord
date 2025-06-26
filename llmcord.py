@@ -2,6 +2,7 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import logging
 from typing import Any, Literal, Optional
 
@@ -9,6 +10,8 @@ import discord
 from discord.app_commands import Choice
 from discord.ext import commands
 import httpx
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from openai import AsyncOpenAI
 import yaml
 
@@ -34,11 +37,38 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
         return yaml.safe_load(file)
 
 
+async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
+    """Execute MCP tool - follows existing async pattern"""
+    mcp_config = config.get("mcp_servers", {})
+    
+    for server_name, server_config in mcp_config.items():
+        try:
+            server_params = StdioServerParameters(
+                command=server_config["command"],
+                args=server_config["args"], 
+                env=server_config.get("env")
+            )
+            
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    
+                    if result.content and result.content[0].text:
+                        return result.content[0].text
+                        
+        except Exception:
+            logging.exception(f"Tool execution failed for {tool_name}")
+            
+    return "Tool execution failed"
+
+
 config = get_config()
 curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+mcp_tools = []
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -96,10 +126,43 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
 
 @discord_bot.event
 async def on_ready() -> None:
+    global mcp_tools
+    
     if client_id := config["client_id"]:
         logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
 
     await discord_bot.tree.sync()
+    
+    # Initialize MCP servers
+    mcp_config = config.get("mcp_servers", {})
+    for server_name, server_config in mcp_config.items():
+        try:
+            server_params = StdioServerParameters(
+                command=server_config["command"],
+                args=server_config["args"],
+                env=server_config.get("env")
+            )
+            
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools_response = await session.list_tools()
+                    
+                    # Convert to OpenAI format
+                    for tool in tools_response.tools:
+                        mcp_tools.append({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.inputSchema
+                            }
+                        })
+                    
+                    logging.info(f"Loaded {len(tools_response.tools)} tools from {server_name}")
+                    
+        except Exception as e:
+            logging.exception(f"Failed to load MCP server {server_name}")
 
 
 @discord_bot.event
@@ -245,6 +308,10 @@ async def on_message(new_msg: discord.Message) -> None:
     curr_content = finish_reason = edit_task = None
     response_msgs = []
     response_contents = []
+    
+    # Tool call accumulation
+    current_tool_call = None
+    tool_arguments_str = ""
 
     embed = discord.Embed()
     for warning in sorted(user_warnings):
@@ -255,7 +322,116 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for curr_chunk in await openai_client.chat.completions.create(model=model, messages=messages[::-1], stream=True, extra_body=model_parameters):
+            # Prepare OpenAI parameters
+            openai_params = {
+                "model": model, 
+                "messages": messages[::-1], 
+                "stream": True, 
+                "extra_body": model_parameters
+            }
+            
+            # Add tools if available
+            if mcp_tools:
+                openai_params["tools"] = mcp_tools
+                openai_params["tool_choice"] = "auto"
+            
+            # PHASE 1: Check for tool calls
+            tool_calls_made = False
+            async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
+                if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
+                    continue
+
+                # If we get content instead of tool calls, break and handle normally
+                if choice.delta.content:
+                    curr_content = choice.delta.content
+                    finish_reason = choice.finish_reason
+                    break
+                
+                # Handle tool calls
+                if choice.delta.tool_calls:
+                    tool_calls_made = True
+                    tool_call_delta = choice.delta.tool_calls[0]
+                    
+                    # Start new tool call
+                    if tool_call_delta.id:
+                        current_tool_call = {
+                            "id": tool_call_delta.id,
+                            "name": tool_call_delta.function.name if tool_call_delta.function else None
+                        }
+                        tool_arguments_str = ""
+                        
+                        # Show progress
+                        if current_tool_call["name"]:
+                            embed.description = f"🔍 Using {current_tool_call['name']}..."
+                            embed.color = EMBED_COLOR_INCOMPLETE
+                            
+                            reply_to_msg = new_msg
+                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                            response_msgs.append(response_msg)
+                            
+                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                            await msg_nodes[response_msg.id].lock.acquire()
+                    
+                    # Accumulate function name
+                    if tool_call_delta.function and tool_call_delta.function.name:
+                        current_tool_call["name"] = tool_call_delta.function.name
+                    
+                    # Accumulate arguments
+                    if tool_call_delta.function and tool_call_delta.function.arguments:
+                        tool_arguments_str += tool_call_delta.function.arguments
+                
+                # Tool call complete
+                if choice.finish_reason and current_tool_call:
+                    try:
+                        tool_arguments = json.loads(tool_arguments_str) if tool_arguments_str else {}
+                        tool_result = await execute_mcp_tool(current_tool_call["name"], tool_arguments)
+                        
+                        # Update progress
+                        embed.description = f"✅ Tool completed, generating response..."
+                        embed.color = EMBED_COLOR_INCOMPLETE
+                        await response_msgs[-1].edit(embed=embed)
+                        
+                        # Add assistant message with tool call
+                        messages.insert(0, {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": current_tool_call["id"],
+                                "type": "function", 
+                                "function": {
+                                    "name": current_tool_call["name"],
+                                    "arguments": tool_arguments_str
+                                }
+                            }]
+                        })
+                        
+                        # Add tool result
+                        messages.insert(0, {
+                            "role": "tool",
+                            "content": tool_result,
+                            "tool_call_id": current_tool_call["id"]
+                        })
+                        
+                    except Exception:
+                        logging.exception("Tool execution failed")
+                        embed.description = "⚠️ Tool execution failed, continuing..."
+                        embed.color = EMBED_COLOR_INCOMPLETE
+                        await response_msgs[-1].edit(embed=embed)
+                    
+                    break
+            
+            # PHASE 2: Get actual response (either continuation or after tool execution)
+            if tool_calls_made:
+                # Update params with tool results and make new request
+                openai_params["messages"] = messages[::-1]
+                openai_params.pop("tools", None)  # Remove tools for second call
+                openai_params.pop("tool_choice", None)
+                
+                # Reset streaming variables
+                curr_content = finish_reason = None
+            
+            # Stream the actual response
+            async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
                 if finish_reason != None:
                     break
 
@@ -263,7 +439,6 @@ async def on_message(new_msg: discord.Message) -> None:
                     continue
 
                 finish_reason = choice.finish_reason
-
                 prev_content = curr_content or ""
                 curr_content = choice.delta.content or ""
 
