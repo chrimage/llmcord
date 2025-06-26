@@ -454,6 +454,9 @@ async def on_message(new_msg: discord.Message) -> None:
                 response_contents = [final_content]
             else:
                 # Stream the actual response (only for non-tool responses)
+                # Reset curr_content and finish_reason if we fell through from Phase 1 without making a tool call
+                curr_content = None
+                finish_reason = None
                 async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
                     if finish_reason != None:
                         break
