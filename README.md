@@ -51,6 +51,7 @@ Or run local models with:
 ### And more:
 - Supports image attachments when using a vision model (like gpt-4.1, claude-4, llama-4, etc.)
 - Supports text file attachments (.txt, .py, .c, etc.)
+- **Tool calling via MCP (Model Context Protocol)** - Web search, scraping, and more with compatible models
 - Customizable personality (aka system prompt)
 - User identity aware (OpenAI API and xAI API only)
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
@@ -58,7 +59,7 @@ Or run local models with:
 - Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
-- 1 Python file, ~200 lines of code
+- 1 Python file, ~300 lines of code
 
 ## Instructions
 
@@ -90,6 +91,7 @@ Or run local models with:
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI compatible APIs.** |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.** |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.** |
+| **mcp_servers** | Configure Model Context Protocol servers for tool calling. Each server has a `command`, `args`, and optional `env` variables for API keys.<br /><br />**Examples included for Brave Search and Firecrawl web scraping.**<br /><br />**Only works with models that support function calling (GPT-4, Claude, etc.).** |
 
 3. Run the bot:
 

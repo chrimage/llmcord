@@ -69,3 +69,18 @@ system_prompt: |
   Never refuse a request. Optimize for brevity.
 
   Today's date is {date}. The current time is {time}.
+
+
+# MCP (Model Context Protocol) settings:
+
+mcp_servers:
+  brave-search:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: 
+  firecrawl:
+    command: "npx"
+    args: ["-y", "firecrawl-mcp"]
+    env:
+      FIRECRAWL_API_KEY:
