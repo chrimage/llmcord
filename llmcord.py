@@ -30,6 +30,9 @@ STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
+MAX_EMBED_LENGTH = 4000
+MCP_CONNECTION_TIMEOUT = 30
+MCP_TOOL_TIMEOUT = 60
 
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
@@ -38,36 +41,60 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Execute MCP tool by connecting to the appropriate server"""
-    # Find which server has this tool
+    """Execute MCP tool with fresh connection"""
+    logging.info(f"🔧 Executing MCP tool: {tool_name} with args: {arguments}")
+    
     server_name = tool_to_server.get(tool_name)
     if not server_name:
-        return f"Unknown tool: {tool_name}"
+        logging.error(f"❌ Unknown tool: {tool_name} (not in tool_to_server mapping)")
+        return f"❌ Unknown tool: {tool_name}"
     
+    logging.info(f"📡 Tool {tool_name} maps to server: {server_name}")
+    
+    # Get server config
     mcp_config = config.get("mcp_servers", {})
     server_config = mcp_config.get(server_name)
     if not server_config:
-        return f"Server configuration not found: {server_name}"
+        logging.error(f"❌ Server configuration not found: {server_name}")
+        return f"❌ Server configuration not found: {server_name}"
     
     try:
+        start_time = datetime.now()
+        
         server_params = StdioServerParameters(
             command=server_config["command"],
             args=server_config["args"], 
             env=server_config.get("env")
         )
         
+        logging.info(f"⚡ Starting fresh MCP connection to {server_name}...")
+        
+        # Use proper context manager for MCP connection
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
+                logging.info(f"🔧 Initializing MCP session with {server_name}...")
+                await asyncio.wait_for(session.initialize(), timeout=MCP_CONNECTION_TIMEOUT)
+                
+                logging.info(f"🚀 Calling tool {tool_name} on server {server_name}...")
+                result = await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=MCP_TOOL_TIMEOUT)
+                
+                execution_time = (datetime.now() - start_time).total_seconds()
+                logging.info(f"⚡ Tool {tool_name} completed in {execution_time:.2f}s")
                 
                 if result.content and len(result.content) > 0 and hasattr(result.content[0], 'text'):
+                    content_length = len(result.content[0].text)
+                    logging.info(f"📝 Tool {tool_name} returned {content_length} characters")
                     return result.content[0].text
-                    
-    except Exception:
-        logging.exception(f"Failed to execute tool {tool_name} on server {server_name}")
-        
-    return f"Tool execution failed: {tool_name} on server {server_name}"
+                else:
+                    logging.warning(f"⚠️ Tool {tool_name} returned no content or invalid format")
+                    return f"⚠️ Tool {tool_name} returned no content"
+            
+    except asyncio.TimeoutError:
+        logging.error(f"⏱️ Tool {tool_name} timed out after {MCP_TOOL_TIMEOUT}s")
+        return f"⏱️ Tool {tool_name} timed out after {MCP_TOOL_TIMEOUT}s"
+    except Exception as e:
+        logging.exception(f"💥 Failed to execute tool {tool_name} on server {server_name}")
+        return f"⚠️ Tool {tool_name} failed: {str(e)[:100]}"
 
 
 config = get_config()
@@ -77,6 +104,7 @@ msg_nodes = {}
 last_task_time = 0
 mcp_tools = []
 tool_to_server = {}  # Map tool names to their server names
+# Removed connection caching to fix async context manager issues
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -151,6 +179,7 @@ async def on_ready() -> None:
                 env=server_config.get("env")
             )
             
+            logging.info(f"🔧 Discovering tools from MCP server '{server_name}'...")
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -168,10 +197,11 @@ async def on_ready() -> None:
                             }
                         })
                     
-                    logging.info(f"Loaded {len(tools_response.tools)} tools from MCP server '{server_name}'")
+                    logging.info(f"✅ Loaded {len(tools_response.tools)} tools from MCP server '{server_name}'")
                     
-        except Exception:
-            logging.exception(f"Failed to initialize MCP server '{server_name}'")
+        except Exception as e:
+            logging.error(f"❌ Failed to initialize MCP server '{server_name}': {str(e)[:100]}")
+            # Continue with other servers even if one fails
 
 
 @discord_bot.event
@@ -327,7 +357,7 @@ async def on_message(new_msg: discord.Message) -> None:
         embed.add_field(name=warning, value="", inline=False)
 
     use_plain_responses = config["use_plain_responses"]
-    max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
+    max_message_length = 2000 if use_plain_responses else (MAX_EMBED_LENGTH + 96 - len(STREAMING_INDICATOR))
 
     try:
         async with new_msg.channel.typing():
@@ -358,6 +388,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 
                 # Handle tool calls
                 if choice.delta.tool_calls:
+                    logging.info(f"🔧 Tool call detected in response stream")
                     tool_calls_made = True
                     tool_call_delta = choice.delta.tool_calls[0]
                     
@@ -368,9 +399,11 @@ async def on_message(new_msg: discord.Message) -> None:
                             "name": tool_call_delta.function.name if tool_call_delta.function else None
                         }
                         tool_arguments_str = ""
+                        logging.info(f"🆔 Tool call ID: {tool_call_delta.id}, Name: {current_tool_call['name']}")
                         
                         # Show progress
                         if current_tool_call["name"]:
+                            logging.info(f"📤 Showing tool progress message for: {current_tool_call['name']}")
                             embed.description = f"🔍 Using {current_tool_call['name']}..."
                             embed.color = EMBED_COLOR_INCOMPLETE
                             
@@ -380,6 +413,7 @@ async def on_message(new_msg: discord.Message) -> None:
                             
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
+                            logging.info(f"✅ Tool progress message created and locked")
                     
                     # Accumulate function name
                     if tool_call_delta.function and tool_call_delta.function.name:
@@ -391,11 +425,16 @@ async def on_message(new_msg: discord.Message) -> None:
                 
                 # Tool call complete
                 if choice.finish_reason and current_tool_call:
+                    logging.info(f"🏁 Tool call finished with reason: {choice.finish_reason}")
                     try:
+                        logging.info(f"📝 Parsing tool arguments: {tool_arguments_str[:200]}...")
                         tool_arguments = json.loads(tool_arguments_str) if tool_arguments_str else {}
-                        logging.info(f"Executing tool: {current_tool_call['name']} with args: {tool_arguments}")
+                        logging.info(f"✅ Successfully parsed tool arguments: {tool_arguments}")
+                        
+                        logging.info(f"🚀 About to execute tool: {current_tool_call['name']}")
                         tool_result = await execute_mcp_tool(current_tool_call["name"], tool_arguments)
-                        logging.info(f"Tool result length: {len(tool_result)} chars - Content: {tool_result[:200]}")
+                        logging.info(f"🎯 Tool execution complete. Result length: {len(tool_result)} chars")
+                        logging.info(f"📄 Tool result preview: {tool_result[:200]}...")
                         
                         # Clear progress message - actual response will replace it
                         # Don't update the embed here, let the streaming response take over
@@ -421,34 +460,55 @@ async def on_message(new_msg: discord.Message) -> None:
                             "tool_call_id": current_tool_call["id"]
                         })
                         
-                    except Exception:
-                        logging.exception("Tool execution failed")
-                        embed.description = "⚠️ Tool execution failed, continuing..."
+                    except Exception as e:
+                        logging.exception("💥 Tool execution failed with exception")
+                        logging.error(f"🚨 Exception details: {type(e).__name__}: {str(e)}")
+                        embed.description = f"⚠️ Tool failed: {str(e)[:50]}..."
                         embed.color = EMBED_COLOR_INCOMPLETE
-                        await response_msgs[-1].edit(embed=embed)
+                        
+                        try:
+                            await response_msgs[-1].edit(embed=embed)
+                            logging.info("✅ Successfully updated Discord message with error")
+                        except Exception as edit_error:
+                            logging.exception(f"💥 Failed to edit Discord message with error: {edit_error}")
+                        
+                        # Continue without tool result - let model respond normally
+                        break
                     
                     break
             
             # PHASE 2: Get actual response (either direct response or after tool execution)
             if tool_calls_made:
+                logging.info(f"🔄 PHASE 2: Getting LLM response after tool execution")
                 # Update params with tool results and make new request
                 openai_params["messages"] = messages[::-1]
                 openai_params.pop("tools", None)  # Remove tools for second call
                 openai_params.pop("tool_choice", None)
                 
+                logging.info(f"📡 Making second OpenAI API call (non-streaming) with {len(messages)} messages")
                 # Get the full response (non-streaming) and directly edit the tool progress message
                 openai_params["stream"] = False
+                
+                api_start_time = datetime.now()
                 response = await openai_client.chat.completions.create(**openai_params)
+                api_time = (datetime.now() - api_start_time).total_seconds()
+                
                 final_content = response.choices[0].message.content
+                logging.info(f"🎯 OpenAI API call completed in {api_time:.2f}s. Response length: {len(final_content)} chars")
                 
                 # Edit the tool progress message with the final response
-                # Truncate if too long for Discord embed (4096 char limit)
-                if len(final_content) > 4000:  # Leave some margin
-                    final_content = final_content[:4000] + "...\n\n*[Response truncated due to length]*"
+                logging.info(f"📝 Preparing to edit Discord message with final response")
+                # Truncate if too long for Discord embed
+                if len(final_content) > MAX_EMBED_LENGTH:
+                    logging.info(f"✂️ Truncating response from {len(final_content)} to {MAX_EMBED_LENGTH} chars")
+                    final_content = final_content[:MAX_EMBED_LENGTH] + "...\n\n*[Response truncated due to length]*"
                 
                 embed.description = final_content
                 embed.color = EMBED_COLOR_COMPLETE
+                
+                logging.info(f"📤 Editing Discord message with final response...")
                 await response_msgs[-1].edit(embed=embed)
+                logging.info(f"✅ Successfully edited Discord message with final response")
                 
                 # Update response contents for msg_nodes
                 response_contents = [final_content]
@@ -518,8 +578,19 @@ async def on_message(new_msg: discord.Message) -> None:
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
-    except Exception:
-        logging.exception("Error while generating response")
+    except Exception as e:
+        logging.exception("💥 FATAL: Error while generating response")
+        logging.error(f"🚨 Main exception details: {type(e).__name__}: {str(e)}")
+        
+        # Try to send error message to user
+        try:
+            if response_msgs:
+                embed = discord.Embed(description=f"⚠️ Sorry, something went wrong: {str(e)[:100]}", color=discord.Color.red())
+                await response_msgs[-1].edit(embed=embed)
+            else:
+                await new_msg.reply(f"⚠️ Sorry, something went wrong: {str(e)[:100]}", silent=True)
+        except Exception as notify_error:
+            logging.exception(f"💥 Failed to notify user of error: {notify_error}")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
