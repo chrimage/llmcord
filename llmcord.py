@@ -38,29 +38,36 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Execute MCP tool - follows existing async pattern"""
-    mcp_config = config.get("mcp_servers", {})
+    """Execute MCP tool by connecting to the appropriate server"""
+    # Find which server has this tool
+    server_name = tool_to_server.get(tool_name)
+    if not server_name:
+        return f"Unknown tool: {tool_name}"
     
-    for server_name, server_config in mcp_config.items():
-        try:
-            server_params = StdioServerParameters(
-                command=server_config["command"],
-                args=server_config["args"], 
-                env=server_config.get("env")
-            )
-            
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
+    mcp_config = config.get("mcp_servers", {})
+    server_config = mcp_config.get(server_name)
+    if not server_config:
+        return f"Server configuration not found: {server_name}"
+    
+    try:
+        server_params = StdioServerParameters(
+            command=server_config["command"],
+            args=server_config["args"], 
+            env=server_config.get("env")
+        )
+        
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments)
+                
+                if result.content and len(result.content) > 0 and hasattr(result.content[0], 'text'):
+                    return result.content[0].text
                     
-                    if result.content and result.content[0].text:
-                        return result.content[0].text
-                        
-        except Exception:
-            logging.exception(f"Tool execution failed for {tool_name}")
-            
-    return "Tool execution failed"
+    except Exception:
+        logging.exception(f"Failed to execute tool {tool_name} on server {server_name}")
+        
+    return f"Tool execution failed: {tool_name} on server {server_name}"
 
 
 config = get_config()
@@ -69,6 +76,7 @@ curr_model = next(iter(config["models"]))
 msg_nodes = {}
 last_task_time = 0
 mcp_tools = []
+tool_to_server = {}  # Map tool names to their server names
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -133,7 +141,7 @@ async def on_ready() -> None:
 
     await discord_bot.tree.sync()
     
-    # Initialize MCP servers
+    # Initialize MCP servers and load available tools
     mcp_config = config.get("mcp_servers", {})
     for server_name, server_config in mcp_config.items():
         try:
@@ -148,8 +156,9 @@ async def on_ready() -> None:
                     await session.initialize()
                     tools_response = await session.list_tools()
                     
-                    # Convert to OpenAI format
+                    # Convert MCP tools to OpenAI function calling format
                     for tool in tools_response.tools:
+                        tool_to_server[tool.name] = server_name  # Track which server has which tool
                         mcp_tools.append({
                             "type": "function",
                             "function": {
@@ -159,10 +168,10 @@ async def on_ready() -> None:
                             }
                         })
                     
-                    logging.info(f"Loaded {len(tools_response.tools)} tools from {server_name}")
+                    logging.info(f"Loaded {len(tools_response.tools)} tools from MCP server '{server_name}'")
                     
-        except Exception as e:
-            logging.exception(f"Failed to load MCP server {server_name}")
+        except Exception:
+            logging.exception(f"Failed to initialize MCP server '{server_name}'")
 
 
 @discord_bot.event
@@ -309,7 +318,7 @@ async def on_message(new_msg: discord.Message) -> None:
     response_msgs = []
     response_contents = []
     
-    # Tool call accumulation
+    # Tool call accumulation for streaming tool data
     current_tool_call = None
     tool_arguments_str = ""
 
@@ -335,7 +344,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 openai_params["tools"] = mcp_tools
                 openai_params["tool_choice"] = "auto"
             
-            # PHASE 1: Check for tool calls
+            # PHASE 1: Check for tool calls (OpenAI may choose to call tools instead of responding directly)
             tool_calls_made = False
             async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
                 if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
@@ -384,12 +393,12 @@ async def on_message(new_msg: discord.Message) -> None:
                 if choice.finish_reason and current_tool_call:
                     try:
                         tool_arguments = json.loads(tool_arguments_str) if tool_arguments_str else {}
+                        logging.info(f"Executing tool: {current_tool_call['name']} with args: {tool_arguments}")
                         tool_result = await execute_mcp_tool(current_tool_call["name"], tool_arguments)
+                        logging.info(f"Tool result length: {len(tool_result)} chars - Content: {tool_result[:200]}")
                         
-                        # Update progress
-                        embed.description = f"✅ Tool completed, generating response..."
-                        embed.color = EMBED_COLOR_INCOMPLETE
-                        await response_msgs[-1].edit(embed=embed)
+                        # Clear progress message - actual response will replace it
+                        # Don't update the embed here, let the streaming response take over
                         
                         # Add assistant message with tool call
                         messages.insert(0, {
@@ -420,62 +429,82 @@ async def on_message(new_msg: discord.Message) -> None:
                     
                     break
             
-            # PHASE 2: Get actual response (either continuation or after tool execution)
+            # PHASE 2: Get actual response (either direct response or after tool execution)
             if tool_calls_made:
                 # Update params with tool results and make new request
                 openai_params["messages"] = messages[::-1]
                 openai_params.pop("tools", None)  # Remove tools for second call
                 openai_params.pop("tool_choice", None)
                 
-                # Reset streaming variables
-                curr_content = finish_reason = None
-            
-            # Stream the actual response
-            async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
-                if finish_reason != None:
-                    break
+                # Get the full response (non-streaming) and directly edit the tool progress message
+                openai_params["stream"] = False
+                response = await openai_client.chat.completions.create(**openai_params)
+                final_content = response.choices[0].message.content
+                
+                # Edit the tool progress message with the final response
+                # Truncate if too long for Discord embed (4096 char limit)
+                if len(final_content) > 4000:  # Leave some margin
+                    final_content = final_content[:4000] + "...\n\n*[Response truncated due to length]*"
+                
+                embed.description = final_content
+                embed.color = EMBED_COLOR_COMPLETE
+                await response_msgs[-1].edit(embed=embed)
+                
+                # Update response contents for msg_nodes
+                response_contents = [final_content]
+            else:
+                # Stream the actual response (only for non-tool responses)
+                async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
+                    if finish_reason != None:
+                        break
 
-                if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
-                    continue
+                    if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
+                        continue
 
-                finish_reason = choice.finish_reason
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
+                    finish_reason = choice.finish_reason
+                    prev_content = curr_content or ""
+                    curr_content = choice.delta.content or ""
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                    new_content = prev_content if finish_reason == None else (prev_content + curr_content)
 
-                if response_contents == [] and new_content == "":
-                    continue
+                    if response_contents == [] and new_content == "":
+                        continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
+                    # Only create a new message if we have NO messages, or if we need to split due to length
+                    should_create_new = (response_msgs == [] and response_contents == []) or (response_contents and len(response_contents[-1] + new_content) > max_message_length)
+                    if start_next_msg := should_create_new:
+                        response_contents.append("")
 
-                response_contents[-1] += new_content
+                    # Ensure we have at least one content entry
+                    if not response_contents:
+                        response_contents.append("")
+                        
+                    response_contents[-1] += new_content
 
-                if not use_plain_responses:
-                    ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                    if not use_plain_responses:
+                        ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
+                        msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
+                        is_final_edit = finish_reason != None or msg_split_incoming
+                        is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        if edit_task != None:
-                            await edit_task
+                        if start_next_msg or ready_to_edit or is_final_edit:
+                            if edit_task != None:
+                                await edit_task
 
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                            embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                        if start_next_msg:
-                            reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
-                            response_msgs.append(response_msg)
+                            if start_next_msg:
+                                reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
+                                response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                                response_msgs.append(response_msg)
 
-                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                            await msg_nodes[response_msg.id].lock.acquire()
-                        else:
-                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
+                                msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                                await msg_nodes[response_msg.id].lock.acquire()
+                            else:
+                                edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
-                        last_task_time = datetime.now().timestamp()
+                            last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
                 for content in response_contents:
