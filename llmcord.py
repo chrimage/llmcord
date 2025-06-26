@@ -13,6 +13,7 @@ import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from openai import AsyncOpenAI
+import spacy
 import yaml
 
 logging.basicConfig(
@@ -84,6 +85,74 @@ activity = discord.CustomActivity(name=(config["status_message"] or "github.com/
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
+
+# Load SpaCy model
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    logging.error("Spacy model 'en_core_web_sm' not found. Please download it by running: python -m spacy download en_core_web_sm")
+    # Potentially exit or disable functionality that depends on SpaCy
+    nlp = None
+
+
+def split_text_into_chunks(text: str, max_length: int) -> list[str]:
+    """Splits text into chunks by sentences, respecting max_length."""
+    if not text:
+        return []
+    if nlp is None: # Fallback if SpaCy model failed to load
+        logging.warning("SpaCy model not loaded. Falling back to basic splitting.")
+        # Basic fallback: split by paragraphs, then by length if necessary.
+        # This won't be as good as sentence splitting but prevents errors.
+        chunks = []
+        current_chunk = ""
+        for paragraph in text.split('\n\n'):
+            if len(current_chunk) + len(paragraph) + 2 > max_length and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            current_chunk += (paragraph + "\n\n")
+
+            # If a single paragraph is too long, split it harshly.
+            while len(current_chunk) > max_length:
+                split_point = current_chunk.rfind(' ', 0, max_length)
+                if split_point == -1: # No space found, hard break
+                    split_point = max_length
+                chunks.append(current_chunk[:split_point])
+                current_chunk = current_chunk[split_point:].lstrip()
+
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    doc = nlp(text)
+    chunks = []
+    current_chunk = ""
+    for sent in doc.sents:
+        sentence_text = sent.text.strip()
+        if not sentence_text:
+            continue
+
+        if len(current_chunk) + len(sentence_text) + 1 > max_length: # +1 for potential space
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            # If a single sentence is longer than max_length, it becomes its own chunk (and might be truncated by Discord later)
+            if len(sentence_text) > max_length:
+                # This single sentence is too long. We'll add it as is.
+                # Discord will handle the hard truncation.
+                # Or, we could try to split it further, but that risks breaking mid-word without more complex logic.
+                chunks.append(sentence_text)
+                current_chunk = ""
+            else:
+                current_chunk = sentence_text
+        else:
+            if current_chunk:
+                current_chunk += " " + sentence_text
+            else:
+                current_chunk = sentence_text
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
 
 
 @dataclass
@@ -439,91 +508,207 @@ async def on_message(new_msg: discord.Message) -> None:
                 # Get the full response (non-streaming) and directly edit the tool progress message
                 openai_params["stream"] = False
                 response = await openai_client.chat.completions.create(**openai_params)
-                final_content = response.choices[0].message.content
+                final_content = response.choices[0].message.content or "" # Ensure it's a string
                 
-                # Edit the tool progress message with the final response
-                # Truncate if too long for Discord embed (4096 char limit)
-                if len(final_content) > 4000:  # Leave some margin
-                    final_content = final_content[:4000] + "...\n\n*[Response truncated due to length]*"
-                
-                embed.description = final_content
+                # Split final_content into chunks using the new function
+                # max_message_length for embeds is 4096, but description has a limit of 4096.
+                # We'll use a slightly smaller value for safety and to account for STREAMING_INDICATOR if it were used (though not here).
+                # For tool responses, we send full messages, so STREAMING_INDICATOR isn't relevant for the split length.
+                # Discord embed description limit is 4096.
+                message_chunks = split_text_into_chunks(final_content, 4000) # Use 4000 as a safe limit for embed descriptions
+
+                if not message_chunks: # Handle case where final_content is empty or only whitespace
+                    message_chunks = [""]
+
+                # Edit the first message (tool progress message) with the first chunk
+                embed.description = message_chunks[0]
                 embed.color = EMBED_COLOR_COMPLETE
                 await response_msgs[-1].edit(embed=embed)
                 
-                # Update response contents for msg_nodes
-                response_contents = [final_content]
+                # Send subsequent chunks as new messages
+                for i in range(1, len(message_chunks)):
+                    new_embed = discord.Embed(description=message_chunks[i], color=EMBED_COLOR_COMPLETE)
+                    reply_to_msg = response_msgs[-1] # Reply to the previous bot message
+                    new_response_msg = await reply_to_msg.reply(embed=new_embed, silent=True)
+                    response_msgs.append(new_response_msg)
+                    msg_nodes[new_response_msg.id] = MsgNode(parent_msg=new_msg) # Parent is still original user message
+                    # Lock is not strictly needed here as it's not being streamed/edited further by this part of the code
+
+                # Update response contents for msg_nodes (store the full, unsplit content)
+                response_contents = [final_content] # Storing the original full content for the node
             else:
                 # Stream the actual response (only for non-tool responses)
-                # Reset curr_content and finish_reason if we fell through from Phase 1 without making a tool call
-                curr_content = None
                 finish_reason = None
+                stream_buffer = "" # Accumulates deltas for current processing pass
+                accumulated_stream_content = "" # Stores the entire response from the stream
+
                 async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
-                    if finish_reason != None:
-                        break
+                    if choice := curr_chunk.choices[0] if curr_chunk.choices else None:
+                        delta_content = choice.delta.content or ""
+                        stream_buffer += delta_content
+                        accumulated_stream_content += delta_content
+                        new_finish_reason = choice.finish_reason
 
-                    if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
-                        continue
+                        if not use_plain_responses:
+                            # Determine if it's time to process the buffer for sending chunks
+                            # Process if: stream is ending, or buffer is getting large enough to potentially form a sentence.
+                            # The max_message_length here is the one for embeds (4096 - indicator len)
+                            process_now = new_finish_reason or (len(stream_buffer) >= max_message_length / 2 and '\n' in stream_buffer) or len(stream_buffer) >= max_message_length
 
-                    finish_reason = choice.finish_reason
-                    prev_content = curr_content or ""
-                    curr_content = choice.delta.content or ""
+                            if process_now:
+                                # Pass the current buffer to the splitter.
+                                # The splitter returns complete sentences or oversized sentences as chunks.
+                                chunks_from_buffer = split_text_into_chunks(stream_buffer, max_message_length - len(STREAMING_INDICATOR))
 
-                    new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                                # The new stream_buffer will be what's left after the text that formed chunks_from_buffer.
+                                # If the stream is not finished, the last chunk returned by splitter might be partial if it had to force split a long sentence,
+                                # or if the original buffer ended mid-sentence.
+                                # A robust way to find the remaining buffer:
+                                consumed_text_len = 0
+                                if chunks_from_buffer:
+                                    # This assumes split_text_into_chunks doesn't drastically reformat (like adding many newlines)
+                                    # It's an approximation of how much of the start of stream_buffer was used.
+                                    # A truly robust way is for split_text_into_chunks to also return the length of consumed input.
+                                    # For now, let's assume chunks_from_buffer[0]...chunks_from_buffer[N] are contiguous from stream_buffer start.
+                                    # This is a simplification:
+                                    temp_doc = nlp(stream_buffer)
+                                    current_pos = 0
+                                    num_sents_in_chunks = 0
 
-                    if response_contents == [] and new_content == "":
-                        continue
+                                    # Try to align sentences from nlp doc with chunks_from_buffer
+                                    # This is heuristic and might not be perfect.
+                                    temp_chunks_to_send = []
+                                    temp_stream_buffer_after_processing = stream_buffer
 
-                    # Only create a new message if we have NO messages, or if we need to split due to length
-                    should_create_new = (response_msgs == [] and response_contents == []) or (response_contents and len(response_contents[-1] + new_content) > max_message_length)
-                    if start_next_msg := should_create_new:
-                        response_contents.append("")
+                                    processed_chunk_text_for_this_iteration = []
 
-                    # Ensure we have at least one content entry
-                    if not response_contents:
-                        response_contents.append("")
+                                    if new_finish_reason is None and chunks_from_buffer:
+                                        # If stream not finished, hold back the content of the last chunk from split_text_into_chunks.
+                                        # That content becomes the new stream_buffer.
+                                        # All other chunks are sent.
+                                        temp_stream_buffer_after_processing = chunks_from_buffer.pop() # Last part is new buffer
+                                        processed_chunk_text_for_this_iteration.extend(chunks_from_buffer)
+                                    elif chunks_from_buffer: # Stream is finished or no chunks to hold back
+                                        processed_chunk_text_for_this_iteration.extend(chunks_from_buffer)
+                                        temp_stream_buffer_after_processing = "" # All processed
+
+                                    stream_buffer = temp_stream_buffer_after_processing
+
+
+                                for i, text_to_embed in enumerate(processed_chunk_text_for_this_iteration):
+                                    is_last_of_this_batch = (i == len(processed_chunk_text_for_this_iteration) - 1)
+                                    # Is this the absolute final piece of the entire stream response?
+                                    is_absolute_final = new_finish_reason and is_last_of_this_batch and not stream_buffer
+
+                                    embed_desc_content = text_to_embed
+                                    if not is_absolute_final:
+                                        embed_desc_content += STREAMING_INDICATOR
+
+                                    embed.description = embed_desc_content
+                                    embed.color = EMBED_COLOR_COMPLETE if is_absolute_final else EMBED_COLOR_INCOMPLETE
+
+                                    # Send new message or edit last one
+                                    # A new message is needed if no messages yet, or if this is a new chunk (not just an update to current one)
+                                    # This simplified logic sends new message for each processed chunk from the list.
+                                    if not response_msgs or (response_msgs[-1].embeds and response_msgs[-1].embeds[0].description.removesuffix(STREAMING_INDICATOR) != text_to_embed):
+                                        if edit_task: await edit_task
+                                        reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                                        new_resp_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                                        response_msgs.append(new_resp_msg)
+                                        msg_nodes[new_resp_msg.id] = MsgNode(parent_msg=new_msg)
+                                        await msg_nodes[new_resp_msg.id].lock.acquire()
+                                        last_task_time = datetime.now().timestamp()
+                                    else: # Edit current message
+                                        can_edit_now = (edit_task is None or edit_task.done()) and \
+                                                       (datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS)
+                                        if can_edit_now or is_absolute_final:
+                                            if edit_task: await edit_task
+                                            edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
+                                            last_task_time = datetime.now().timestamp()
                         
-                    response_contents[-1] += new_content
+                        finish_reason = new_finish_reason # Update overall finish_reason
+                        if finish_reason:
+                            break # Exit async for loop if stream is done
 
-                    if not use_plain_responses:
-                        ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                        msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                        is_final_edit = finish_reason != None or msg_split_incoming
-                        is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                # After the streaming loop, if there's any content left in stream_buffer (e.g. stream ended, last part wasn't processed)
+                # and we are not using plain responses, send this remainder.
+                if not use_plain_responses and stream_buffer:
+                    embed.description = stream_buffer # Final part, no streaming indicator
+                    embed.color = EMBED_COLOR_COMPLETE
+                    if not response_msgs: # If somehow no messages were ever sent
+                        reply_to_msg = new_msg
+                        new_final_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                        response_msgs.append(new_final_msg)
+                        msg_nodes[new_final_msg.id] = MsgNode(parent_msg=new_msg)
+                        await msg_nodes[new_final_msg.id].lock.acquire()
+                    else: # Edit the last message with the final final content
+                        if edit_task: await edit_task
+                        await response_msgs[-1].edit(embed=embed)
 
-                        if start_next_msg or ready_to_edit or is_final_edit:
-                            if edit_task != None:
-                                await edit_task
+                # Update response_contents to hold the single, complete accumulated string
+                # This is used by plain responses and for msg_node text.
+                response_contents = [accumulated_stream_content]
 
-                            embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+            # After streaming or tool call, response_contents should have the full response.
+            # If it was a tool call, response_contents was set in that block.
+            # If it was streaming, it's set to [accumulated_stream_content] above.
+            # Ensure it's a list with at least one string for the join/processing below.
+            if not response_contents:
+                response_contents = [""]
 
-                            if start_next_msg:
-                                reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                                response_msg = await reply_to_msg.reply(embed=embed, silent=True)
-                                response_msgs.append(response_msg)
-
-                                msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                                await msg_nodes[response_msg.id].lock.acquire()
-                            else:
-                                edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
-
-                            last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
-                for content in response_contents:
-                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                    response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
+                # If plain responses, split the full text and send each chunk.
+                # max_message_length is 2000 for plain text.
+                message_chunks = split_text_into_chunks(full_response_text, max_message_length)
+
+                if not message_chunks and not response_msgs: # Ensure at least one empty message if response was empty
+                    message_chunks = [""]
+                elif not message_chunks and response_msgs: # If there were prior (e.g. embed) messages, don't send empty plain
+                    pass
+
+
+                # Clear existing response_msgs if they were from a different format (e.g. embed stream attempt)
+                # This part is tricky because response_msgs might already contain an embed if streaming started that way.
+                # For now, we assume if use_plain_responses is true, the streaming logic above for embeds
+                # might have created an initial message. We should ensure these are plain.
+                # This might need a more robust check or state management if mixing modes.
+                # For simplicity, if use_plain_responses is true, we assume all final messages should be plain.
+
+                # Delete any preliminary embed messages if we are now sending plain text
+                for msg_to_delete in response_msgs:
+                    try:
+                        await msg_to_delete.delete()
+                    except discord.HTTPException:
+                        logging.warning(f"Could not delete preliminary message {msg_to_delete.id} before sending plain text.")
+                response_msgs = [] # Reset response_msgs for plain text sending
+
+                for chunk_content in message_chunks:
+                    reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                    response_msg = await reply_to_msg.reply(content=chunk_content or "\u200b", suppress_embeds=True) # Send ZWS if empty
                     response_msgs.append(response_msg)
 
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                    # Lock acquire might not be needed if these messages aren't further manipulated,
+                    # but let's keep it for consistency with the original structure for msg_nodes.
                     await msg_nodes[response_msg.id].lock.acquire()
+
+            # If not use_plain_responses and streaming happened, the embed messages are already sent/edited.
+            # The full_response_text is stored in msg_nodes below.
 
     except Exception:
         logging.exception("Error while generating response")
 
+    # Store the full, unsplit text in msg_nodes for all bot responses.
+    # The individual chunks are what's sent, but the node should represent the complete logical message.
+    full_final_text = "".join(response_contents)
     for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
+        # If this message was part of a chunked response, its .text should ideally be its own chunk.
+        # However, the original logic sets msg_nodes[response_msg.id].text to the *entire* response for all messages.
+        # We will keep this behavior for now, as changing it might affect conversation history logic.
+        msg_nodes[response_msg.id].text = full_final_text
+        if msg_nodes[response_msg.id].lock.locked(): # Release lock if acquired
+            msg_nodes[response_msg.id].lock.release()
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:

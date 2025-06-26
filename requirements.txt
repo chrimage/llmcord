@@ -3,3 +3,4 @@ httpx
 mcp
 openai
 pyyaml
+spacy
