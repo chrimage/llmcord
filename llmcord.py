@@ -41,46 +41,25 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 
 async def execute_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Execute MCP tool with fresh connection"""
     server_name = tool_to_server.get(tool_name)
     if not server_name:
-        logging.error(f"❌ Unknown tool: {tool_name}")
         return f"❌ Unknown tool: {tool_name}"
     
-    mcp_config = config.get("mcp_servers", {})
-    server_config = mcp_config.get(server_name)
+    server_config = config.get("mcp_servers", {}).get(server_name)
     if not server_config:
-        logging.error(f"❌ Server configuration not found: {server_name}")
-        return f"❌ Server configuration not found: {server_name}"
+        return f"❌ Server not found: {server_name}"
     
     try:
-        start_time = datetime.now()
-        server_params = StdioServerParameters(
-            command=server_config["command"],
-            args=server_config["args"], 
-            env=server_config.get("env")
-        )
-        
+        server_params = StdioServerParameters(command=server_config["command"], args=server_config["args"], env=server_config.get("env"))
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await asyncio.wait_for(session.initialize(), timeout=MCP_CONNECTION_TIMEOUT)
                 result = await asyncio.wait_for(session.call_tool(tool_name, arguments), timeout=MCP_TOOL_TIMEOUT)
-                
-                execution_time = (datetime.now() - start_time).total_seconds()
-                logging.info(f"⚡ Tool {tool_name} completed in {execution_time:.2f}s")
-                
-                if result.content and len(result.content) > 0 and hasattr(result.content[0], 'text'):
-                    return result.content[0].text
-                else:
-                    logging.warning(f"⚠️ Tool {tool_name} returned no content")
-                    return f"⚠️ Tool {tool_name} returned no content"
-            
+                return result.content[0].text if result.content and hasattr(result.content[0], 'text') else f"⚠️ {tool_name} returned no content"
     except asyncio.TimeoutError:
-        logging.error(f"⏱️ Tool {tool_name} timed out after {MCP_TOOL_TIMEOUT}s")
-        return f"⏱️ Tool {tool_name} timed out after {MCP_TOOL_TIMEOUT}s"
+        return f"⏱️ {tool_name} timed out"
     except Exception as e:
-        logging.exception(f"💥 Failed to execute tool {tool_name} on server {server_name}")
-        return f"⚠️ Tool {tool_name} failed: {str(e)[:100]}"
+        return f"⚠️ {tool_name} failed: {str(e)[:50]}"
 
 
 config = get_config()
@@ -156,37 +135,19 @@ async def on_ready() -> None:
     await discord_bot.tree.sync()
     
     # Initialize MCP servers and load available tools
-    mcp_config = config.get("mcp_servers", {})
-    for server_name, server_config in mcp_config.items():
+    for server_name, server_config in config.get("mcp_servers", {}).items():
         try:
-            server_params = StdioServerParameters(
-                command=server_config["command"],
-                args=server_config["args"],
-                env=server_config.get("env")
-            )
-            
+            server_params = StdioServerParameters(command=server_config["command"], args=server_config["args"], env=server_config.get("env"))
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools_response = await session.list_tools()
-                    
-                    # Convert MCP tools to OpenAI function calling format
                     for tool in tools_response.tools:
-                        tool_to_server[tool.name] = server_name  # Track which server has which tool
-                        mcp_tools.append({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description,
-                                "parameters": tool.inputSchema
-                            }
-                        })
-                    
+                        tool_to_server[tool.name] = server_name
+                        mcp_tools.append({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.inputSchema}})
                     logging.info(f"🔧 Loaded {len(tools_response.tools)} tools from MCP server '{server_name}'")
-                    
         except Exception as e:
             logging.error(f"💥 Failed to initialize MCP server '{server_name}': {str(e)[:100]}")
-            # Continue with other servers even if one fails
 
 
 @discord_bot.event
@@ -384,32 +345,24 @@ async def on_message(new_msg: discord.Message) -> None:
                     
                     # Start new tool call
                     if tool_call_delta.id:
-                        logging.info(f"🔧 Tool call detected: {tool_call_delta.function.name if tool_call_delta.function else 'unknown'}")
-                        current_tool_call = {
-                            "id": tool_call_delta.id,
-                            "name": tool_call_delta.function.name if tool_call_delta.function else None
-                        }
+                        current_tool_call = {"id": tool_call_delta.id, "name": tool_call_delta.function.name if tool_call_delta.function else None}
                         tool_arguments_str = ""
                         
                         # Show progress
                         if current_tool_call["name"]:
                             embed.description = f"🔍 Using {current_tool_call['name']}..."
                             embed.color = EMBED_COLOR_INCOMPLETE
-                            
-                            reply_to_msg = new_msg
-                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                            response_msg = await new_msg.reply(embed=embed, silent=True)
                             response_msgs.append(response_msg)
-                            
                             msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                             await msg_nodes[response_msg.id].lock.acquire()
                     
-                    # Accumulate function name
-                    if tool_call_delta.function and tool_call_delta.function.name:
-                        current_tool_call["name"] = tool_call_delta.function.name
-                    
-                    # Accumulate arguments
-                    if tool_call_delta.function and tool_call_delta.function.arguments:
-                        tool_arguments_str += tool_call_delta.function.arguments
+                    # Accumulate function name and arguments
+                    if tool_call_delta.function:
+                        if tool_call_delta.function.name:
+                            current_tool_call["name"] = tool_call_delta.function.name
+                        if tool_call_delta.function.arguments:
+                            tool_arguments_str += tool_call_delta.function.arguments
                 
                 # Tool call complete
                 if choice.finish_reason and current_tool_call:
@@ -442,16 +395,12 @@ async def on_message(new_msg: discord.Message) -> None:
                         })
                         
                     except Exception as e:
-                        logging.exception(f"💥 Tool execution failed: {type(e).__name__}: {str(e)}")
                         embed.description = f"⚠️ Tool failed: {str(e)[:50]}..."
                         embed.color = EMBED_COLOR_INCOMPLETE
-                        
                         try:
                             await response_msgs[-1].edit(embed=embed)
-                        except Exception as edit_error:
-                            logging.exception(f"💥 Failed to edit Discord message with error: {edit_error}")
-                        
-                        # Continue without tool result - let model respond normally
+                        except Exception:
+                            pass
                         break
                     
                     break
