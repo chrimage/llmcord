@@ -105,7 +105,7 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
         if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
             curr_model = model
             output = f"Model switched to: `{model}`"
-            logging.info(f"🔄 {output}")
+            logging.info(output)
         else:
             output = "You don't have permission to change the model."
 
@@ -130,7 +130,7 @@ async def on_ready() -> None:
     global mcp_tools
     
     if client_id := config["client_id"]:
-        logging.info(f"🤖 Bot invite URL: https://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot")
+        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
 
     await discord_bot.tree.sync()
     
@@ -181,8 +181,6 @@ async def on_message(new_msg: discord.Message) -> None:
     is_bad_channel = not is_good_channel or any(id in blocked_channel_ids for id in channel_ids)
 
     if is_bad_user or is_bad_channel:
-        reason = "user" if is_bad_user else "channel"
-        logging.info(f"🚫 Access denied for {reason} (user: {new_msg.author.id}, channel: {new_msg.channel.id})")
         return
 
     provider_slash_model = curr_model
@@ -254,7 +252,7 @@ async def on_message(new_msg: discord.Message) -> None:
                                 curr_node.parent_msg = curr_msg.reference.cached_message or await curr_msg.channel.fetch_message(parent_msg_id)
 
                 except (discord.NotFound, discord.HTTPException):
-                    logging.exception("💥 Error fetching next message in the chain")
+                    logging.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
             if curr_node.images[:max_images]:
@@ -280,11 +278,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
             curr_msg = curr_node.parent_msg
 
-    if len(messages) > 1:
-        logging.info(f"🔗 Built conversation chain: {len(messages)} messages")
-    
-    content_preview = new_msg.content[:200] + "..." if len(new_msg.content) > 200 else new_msg.content
-    logging.info(f"📨 Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}):\n{content_preview}")
+    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
     if system_prompt := config["system_prompt"]:
         now = datetime.now().astimezone()
@@ -309,7 +303,7 @@ async def on_message(new_msg: discord.Message) -> None:
         embed.add_field(name=warning, value="", inline=False)
 
     use_plain_responses = config["use_plain_responses"]
-    max_message_length = 2000 if use_plain_responses else (MAX_EMBED_LENGTH + 96 - len(STREAMING_INDICATOR))
+    max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
 
     try:
         async with new_msg.channel.typing():
@@ -420,11 +414,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 final_content = response.choices[0].message.content
                 
                 # Truncate if too long for Discord embed
-                if len(final_content) > MAX_EMBED_LENGTH:
-                    logging.info(f"⚡ API response in {api_time:.2f}s, {len(final_content)} chars → truncated to {MAX_EMBED_LENGTH}")
-                    final_content = final_content[:MAX_EMBED_LENGTH] + "...\n\n*[Response truncated due to length]*"
-                else:
-                    logging.info(f"⚡ API response in {api_time:.2f}s, {len(final_content)} chars")
+                if len(final_content) > 4096:
+                    final_content = final_content[:4096] + "...\n\n*[Response truncated due to length]*"
                 
                 embed.description = final_content
                 embed.color = EMBED_COLOR_COMPLETE
@@ -498,18 +489,8 @@ async def on_message(new_msg: discord.Message) -> None:
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
-    except Exception as e:
-        logging.exception(f"💥 FATAL: Error while generating response - {type(e).__name__}: {str(e)}")
-        
-        # Try to send error message to user
-        try:
-            if response_msgs:
-                embed = discord.Embed(description=f"⚠️ Sorry, something went wrong: {str(e)[:100]}", color=discord.Color.red())
-                await response_msgs[-1].edit(embed=embed)
-            else:
-                await new_msg.reply(f"⚠️ Sorry, something went wrong: {str(e)[:100]}", silent=True)
-        except Exception as notify_error:
-            logging.exception(f"💥 Failed to notify user of error: {notify_error}")
+    except Exception:
+        logging.exception("Error while generating response")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
@@ -517,11 +498,9 @@ async def on_message(new_msg: discord.Message) -> None:
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
-        num_to_clean = num_nodes - MAX_MESSAGE_NODES
-        for msg_id in sorted(msg_nodes.keys())[: num_to_clean]:
+        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 msg_nodes.pop(msg_id, None)
-        logging.info(f"🗑️ Cleaned {num_to_clean} old message nodes from cache ({num_nodes} → {len(msg_nodes)})")
 
 
 async def main() -> None:
