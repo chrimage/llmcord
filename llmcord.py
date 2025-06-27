@@ -428,73 +428,105 @@ async def on_message(new_msg: discord.Message) -> None:
                 # Reset curr_content and finish_reason if we fell through from Phase 1 without making a tool call
                 curr_content = None
                 finish_reason = None
+                # Accumulate full response before sending for non-tool call responses
+                full_response_content = ""
                 async for curr_chunk in await openai_client.chat.completions.create(**openai_params):
-                    if finish_reason != None:
-                        break
-
                     if not (choice := curr_chunk.choices[0] if curr_chunk.choices else None):
                         continue
 
-                    finish_reason = choice.finish_reason
-                    prev_content = curr_content or ""
-                    curr_content = choice.delta.content or ""
+                    if choice.delta.content:
+                        full_response_content += choice.delta.content
 
-                    new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
+                        break # Ensure we exit once the stream is finished
 
-                    if response_contents == [] and new_content == "":
-                        continue
-
-                    # Only create a new message if we have NO messages, or if we need to split due to length
-                    should_create_new = (response_msgs == [] and response_contents == []) or (response_contents and len(response_contents[-1] + new_content) > max_message_length)
-                    if start_next_msg := should_create_new:
-                        response_contents.append("")
-
-                    # Ensure we have at least one content entry
-                    if not response_contents:
-                        response_contents.append("")
+                if full_response_content:
+                    # Split content if it exceeds max_message_length
+                    # This logic is simplified; real splitting would need to be more careful about cutting words/markdown
+                    temp_content_storage = []
+                    while len(full_response_content) > max_message_length:
+                        # Find a good split point (e.g., newline or space)
+                        split_at = full_response_content.rfind('\n', 0, max_message_length)
+                        if split_at == -1: # If no newline, try space
+                            split_at = full_response_content.rfind(' ', 0, max_message_length)
+                        if split_at == -1 or split_at == 0: # If no good split, force split
+                            split_at = max_message_length
                         
-                    response_contents[-1] += new_content
+                        temp_content_storage.append(full_response_content[:split_at])
+                        full_response_content = full_response_content[split_at:].lstrip()
+                    temp_content_storage.append(full_response_content) # Add the remainder
 
-                    if not use_plain_responses:
-                        ready_to_edit = (edit_task == None or edit_task.done()) and datetime.now().timestamp() - last_task_time >= EDIT_DELAY_SECONDS
-                        msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                        is_final_edit = finish_reason != None or msg_split_incoming
-                        is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                    for content_part in temp_content_storage:
+                        if not content_part.strip(): # Avoid sending empty messages
+                            continue
+                        response_contents.append(content_part) # Store for msg_node later
 
-                        if start_next_msg or ready_to_edit or is_final_edit:
-                            if edit_task != None:
-                                await edit_task
+                        if not use_plain_responses:
+                            embed.description = content_part
+                            embed.color = EMBED_COLOR_COMPLETE # Assuming completion as it's sent at once
 
-                            embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                            reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                            response_msg = await reply_to_msg.reply(embed=embed, silent=True)
+                            response_msgs.append(response_msg)
 
-                            if start_next_msg:
-                                reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                                response_msg = await reply_to_msg.reply(embed=embed, silent=True)
-                                response_msgs.append(response_msg)
+                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                            # Lock is acquired before adding to msg_nodes in the original, maintaining pattern
+                            # but might need release if not handled by the end loop
+                            await msg_nodes[response_msg.id].lock.acquire()
+                        else:
+                            # Handling for use_plain_responses remains, sending content directly
+                            reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                            response_msg = await reply_to_msg.reply(content=content_part, suppress_embeds=True)
+                            response_msgs.append(response_msg)
+                            msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
+                            await msg_nodes[response_msg.id].lock.acquire()
 
-                                msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
-                                await msg_nodes[response_msg.id].lock.acquire()
-                            else:
-                                edit_task = asyncio.create_task(response_msgs[-1].edit(embed=embed))
 
-                            last_task_time = datetime.now().timestamp()
-
-            if use_plain_responses:
-                for content in response_contents:
-                    reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
-                    response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
+            # This section handles sending plain responses if use_plain_responses is true
+            # AND if the response was NOT streamed via the new logic above (e.g. tool call final response)
+            # The new streaming logic for regular messages already handles sending.
+            # We only need to ensure that if use_plain_responses is true, and we have response_contents
+            # that haven't been sent (e.g. from a non-streamed tool response), they get sent.
+            if use_plain_responses and response_contents and not response_msgs: # If content exists but no messages sent yet
+                for content_part in response_contents: # response_contents would have been populated by tool response logic
+                    if not content_part.strip():
+                        continue
+                    reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
+                    response_msg = await reply_to_msg.reply(content=content_part, suppress_embeds=True)
                     response_msgs.append(response_msg)
-
                     msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
     except Exception:
         logging.exception("Error while generating response")
 
+    # Update msg_nodes with the text and release locks
+    # Ensure that text for msg_nodes is correctly assigned from potentially multiple parts
+    full_final_text = "".join(response_contents)
     for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
+        # If response_msgs were created progressively for very long messages,
+        # this simplistic assignment might not be ideal.
+        # However, with the new logic, each response_msg should correspond to a part of the full_final_text.
+        # For simplicity, we'll assign the full text to all, or adjust if parts are stored differently.
+        # The current response_contents should hold the parts that were actually sent.
+        # Let's refine this: each msg_node should get its specific content part.
+        # This requires response_contents to accurately reflect what was sent in each message.
+        # The modified logic appends to response_contents for each part sent.
+        pass # The text is assigned when the message is created/sent in the loop above.
+             # We just need to ensure locks are released.
+
+    for response_msg_id in [msg.id for msg in response_msgs]: # Iterate by ID in case response_msgs list is modified
+        if response_msg_id in msg_nodes and msg_nodes[response_msg_id].lock.locked():
+            # Assign the text to the msg_node. If response_contents has multiple parts,
+            # and response_msgs also has multiple, we need to map them.
+            # For now, let's assume response_contents holds the full concatenated text if not split,
+            # or individual parts if split. The current logic populates response_contents with parts.
+            # The text field of MsgNode is used for conversation history.
+            # So, the *entire* response should be available.
+            msg_nodes[response_msg_id].text = full_final_text # Assign full text for history
+            msg_nodes[response_msg_id].lock.release()
+
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
